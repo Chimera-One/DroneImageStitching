@@ -22,21 +22,35 @@ def load_config(config_path):
     return config
 
 def get_image_paths(config):
-    """Get sorted image paths based on timestamps from filenames."""
-    all_image_files = glob.glob(os.path.join(config["image_directory"], '*.*'))  # Adjust the pattern to include all files
-    image_files_with_timestamps = []
+    """
+    Get sorted image and mask paths based on timestamps from filenames.
+    Returns:
+        tuple: (sorted_image_paths, sorted_mask_paths)
+    """
+    # Load file lists
+    all_image_files = glob.glob(os.path.join(config["image_directory"], '*.*'))
+    
+    # Note: Changed to look for 'mask_directory' to distinguish from images
+    # If your masks are in the same folder, ensure the glob pattern distinguishes them
+    all_mask_image_files = glob.glob(os.path.join(config["mask_image_directory"], '*.*'))
+    all_heatmap_image_files = glob.glob(os.path.join(config["heatmap_image_directory"], '*.*'))
 
-    for filepath in all_image_files:
-        timestamp = extract_timestamp(filepath)
-        if timestamp is not None:
-            image_files_with_timestamps.append((timestamp, filepath))
-        else:
-            print(f"Filename {filepath} does not contain a valid timestamp and will be skipped.")
+    def sort_by_filename(file_list):
+        """Helper to sort files alphabetically by their filename."""
+        return sorted(file_list, key=lambda x: os.path.basename(x))
 
-    # Sort the image files based on timestamp
-    image_files_with_timestamps.sort(key=lambda x: x[0])
-    print(f"Found {len(image_files_with_timestamps)} images to process.")
-    return [filepath for _, filepath in image_files_with_timestamps]
+    # Process both lists
+    sorted_images = sort_by_filename(all_image_files)
+    sorted_masks = sort_by_filename(all_mask_image_files)
+    sorted_heatmaps = sort_by_filename(all_heatmap_image_files)
+
+    # Optional: Safety check to ensure lists are aligned
+    if len(sorted_images) != len(sorted_masks) or len(sorted_masks) != len(sorted_heatmaps):
+        print(f"Warning: Found {len(sorted_images)} images but {len(sorted_masks)} masks and {len(sorted_heatmaps)} heapmaps.")
+    else:
+        print(f"Found {len(sorted_images)} images and matching masks to process.")
+
+    return sorted_images, sorted_masks, sorted_heatmaps
 
     # Sort the image files based on timestamp
     image_files_with_timestamps.sort(key=lambda x: x[0])
@@ -171,7 +185,7 @@ def match_keypoints(feats_list, original_sizes, config):
 
     return transformations, all_corners
 
-def stitch_images(original_images, transformations, all_corners):
+def stitch_images(original_images, mask_images, heatmap_images, transformations, all_corners):
     """Stitch images together into a panorama using original blending logic."""
     print("Starting stitching of images...")
     all_corners = np.vstack(all_corners)
@@ -190,6 +204,8 @@ def stitch_images(original_images, transformations, all_corners):
 
     # Initialize the panorama and mask
     panorama = np.zeros((panorama_height, panorama_width, 3), dtype=np.uint8)
+    panorama_mask = np.zeros((panorama_height, panorama_width, 3), dtype=np.uint8)
+    panorama_heatmap = np.zeros((panorama_height, panorama_width, 3), dtype=np.uint8)
     mask_panorama = np.zeros((panorama_height, panorama_width), dtype=np.uint8)
 
     # Warp and blend each image using the original blending logic
@@ -204,6 +220,8 @@ def stitch_images(original_images, transformations, all_corners):
         # Warp the image
         image_i_np = tensor_to_image(original_images[i])
         warped_image_i = cv2.warpPerspective(image_i_np, H_total, (panorama_width, panorama_height))
+        warped_mask_image_i = cv2.warpPerspective(mask_images[i], H_total, (panorama_width, panorama_height))
+        warped_heatmap_image_i = cv2.warpPerspective(heatmap_images[i], H_total, (panorama_width, panorama_height))
 
         # Warp the mask
         hi, wi = image_i_np.shape[:2]
@@ -213,48 +231,82 @@ def stitch_images(original_images, transformations, all_corners):
         # Update panorama and mask_panorama with original blending logic
         mask_overlap = warped_mask_i > 0
         panorama[mask_overlap] = warped_image_i[mask_overlap]
+        panorama_mask[mask_overlap] = warped_mask_image_i[mask_overlap]
+        panorama_heatmap[mask_overlap] = warped_heatmap_image_i[mask_overlap]
+
+        # Mask for masking panorama
         mask_panorama[mask_overlap] = warped_mask_i[mask_overlap]
         print(f"Stitching image {i + 1} of {len(original_images)}")
 
     print("Stitching completed.")
-    return panorama
+    return panorama, panorama_mask, panorama_heatmap
 
 def run_stitching_pipeline(config_path, save_img=False):
     """Run the complete stitching pipeline with configuration from a YAML file."""
     print("Running image stitching pipeline...")
     config = load_config(config_path)
-    image_paths = get_image_paths(config)
+    
+    # 1. Get paths for both images and masks
+    image_paths, mask_paths, heatmap_paths = get_image_paths(config)
 
-    print("Processing images...")
+    print("Processing images and loading masks...")
     total_images = len(image_paths)
     processed_count = 0
 
     original_images = []
     original_sizes = []
     feats_list = []
+    mask_images = []
+    heatmap_images = []
 
+    # 2. Process images in parallel
     with ThreadPoolExecutor(max_workers=2) as executor:
+        # executor.map preserves the order of input 'image_paths'
         results = executor.map(lambda path: process_image(path, config), image_paths)
 
-    for image_tensor, size, feats in results:
+    # 3. Iterate through results AND mask_paths together to ensure alignment
+    for (image_tensor, size, feats), mask_path, heatmap_path in zip(results, mask_paths, heatmap_paths):
         processed_count += 1
         print(f"Processed {processed_count}/{total_images} images.")
+        
         if image_tensor is not None:
+            # Load the mask as a numpy array
+            # using imread to get the np array (default BGR)
+            # Add cv2.IMREAD_GRAYSCALE if your stitching pipeline expects 1-channel masks
+            mask_np = cv2.imread(mask_path)
+            heatmap_np = cv2.imread(heatmap_path)
+            
+            if mask_np is None:
+                print(f"Warning: Could not load mask at {mask_path}. Skipping corresponding image.")
+                continue
+
+            if heatmap_np is None:
+                print(f"Warning: Could not load heatmap at {heatmap_path}. Skipping corresponding image.")
+                continue
+
+            # Only append data if both image and mask are valid
             original_images.append(image_tensor)
             original_sizes.append(size)
             feats_list.append(feats)
+            mask_images.append(mask_np)
+            heatmap_images.append(heatmap_np)
 
     print("Matching keypoints and estimating transformations...")
     transformations, all_corners = match_keypoints(feats_list, original_sizes, config)
-    panorama = stitch_images(original_images, transformations, all_corners)
+    
+    # 4. Pass the list of np arrays (mask_images) instead of paths
+    panorama, panorama_mask, panorama_heatmap = stitch_images(original_images, mask_images, heatmap_images, transformations, all_corners)
+    
     print("Pipeline completed.")
 
     if config['save_image']:
-        cv2.imwrite(os.path.join(config['output_dir'], config['output_filename']), panorama)
+        cv2.imwrite(os.path.join(config['output_dir'], config['output_filename']) + ".png", panorama)
+        cv2.imwrite(os.path.join(config['output_dir'], config['output_filename']) + "_mask.png", panorama_mask)
+        cv2.imwrite(os.path.join(config['output_dir'], config['output_filename']) + "_heatmap.png", panorama_heatmap)
 
-    return panorama
+    return panorama, panorama_mask, panorama_heatmap
 
 # Use this guard to prevent auto-execution when imported
 if __name__ == "__main__":
     config_path = "config.yaml"
-    panorama = run_stitching_pipeline(config_path)
+    panorama, panorama_mask, panorama_heatmap = run_stitching_pipeline(config_path)

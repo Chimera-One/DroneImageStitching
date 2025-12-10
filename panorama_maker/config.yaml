@@ -1,8 +1,10 @@
 device: "cuda"  # Use "cuda" for GPU, "mps" for Mac, or "cpu"
 image_directory: "../data/ResizedImages"
+mask_image_directory: "../data/Masks"
+heatmap_image_directory: "../data/Heatmaps"
 save_image: True
 output_dir: "../output"
-output_filename: "crop_rows_stitched_small.png"
+output_filename: "output"
 batch_size: 2
 max_workers: 1
 left_crop: 29
